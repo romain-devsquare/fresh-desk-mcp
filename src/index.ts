@@ -1,22 +1,34 @@
 #!/usr/bin/env node
 
+import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import type { Request } from "express";
 import { z } from "zod";
 
-const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN; // e.g. "support.yourcompany.com" or "yourcompany.freshdesk.com"
-const FRESHDESK_API_KEY = process.env.FRESHDESK_API_KEY;
+const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
 
-if (!FRESHDESK_DOMAIN || !FRESHDESK_API_KEY) {
-  console.error(
-    "FRESHDESK_DOMAIN and FRESHDESK_API_KEY environment variables are required"
-  );
+if (!FRESHDESK_DOMAIN) {
+  console.error("FRESHDESK_DOMAIN environment variable is required");
   process.exit(1);
 }
 
 const BASE_URL = `https://${FRESHDESK_DOMAIN}/api/v2`;
+const PORT = parseInt(process.env.PORT || "3000", 10);
+
+// Store the API key per session, extracted from the Authorization header on init
+const sessionApiKeys: Record<string, string> = {};
+
+function getApiKeyFromRequest(req: Request): string | null {
+  const auth = req.headers["authorization"];
+  if (!auth || !auth.startsWith("Bearer ")) return null;
+  return auth.slice(7);
+}
 
 async function freshdeskRequest(
+  apiKey: string,
   path: string,
   method: string = "GET",
   body?: unknown
@@ -26,7 +38,7 @@ async function freshdeskRequest(
 
   const headers: Record<string, string> = {
     Authorization:
-      "Basic " + Buffer.from(FRESHDESK_API_KEY + ":X").toString("base64"),
+      "Basic " + Buffer.from(apiKey + ":X").toString("base64"),
     "Content-Type": "application/json",
   };
 
@@ -55,328 +67,526 @@ async function freshdeskRequest(
   return res.json();
 }
 
-const server = new McpServer({
-  name: "freshdesk",
-  version: "1.0.0",
-});
+function createServer(apiKey: string): McpServer {
+  const server = new McpServer({
+    name: "freshdesk",
+    version: "1.0.0",
+  });
 
-// --- List tickets ---
-server.tool(
-  "list_tickets",
-  "List tickets from Freshdesk. Returns paginated results (30 per page).",
-  {
-    page: z.number().optional().describe("Page number (default 1)"),
-    per_page: z
-      .number()
-      .optional()
-      .describe("Results per page, max 100 (default 30)"),
-    filter: z
-      .enum([
-        "new_and_my_open",
-        "watching",
-        "spam",
-        "deleted",
-      ])
-      .optional()
-      .describe("Predefined filter"),
-    order_by: z
-      .enum(["created_at", "due_by", "updated_at", "status"])
-      .optional()
-      .describe("Field to order by (default created_at)"),
-    order_type: z
-      .enum(["asc", "desc"])
-      .optional()
-      .describe("Order direction (default desc)"),
-  },
-  async (params) => {
-    const query = new URLSearchParams();
-    if (params.page) query.set("page", String(params.page));
-    if (params.per_page) query.set("per_page", String(params.per_page));
-    if (params.filter) query.set("filter", params.filter);
-    if (params.order_by) query.set("order_by", params.order_by);
-    if (params.order_type) query.set("order_type", params.order_type);
+  // --- List tickets ---
+  server.tool(
+    "list_tickets",
+    "List tickets from Freshdesk. Returns paginated results (30 per page).",
+    {
+      page: z.number().optional().describe("Page number (default 1)"),
+      per_page: z
+        .number()
+        .optional()
+        .describe("Results per page, max 100 (default 30)"),
+      filter: z
+        .enum(["new_and_my_open", "watching", "spam", "deleted"])
+        .optional()
+        .describe("Predefined filter"),
+      order_by: z
+        .enum(["created_at", "due_by", "updated_at", "status"])
+        .optional()
+        .describe("Field to order by (default created_at)"),
+      order_type: z
+        .enum(["asc", "desc"])
+        .optional()
+        .describe("Order direction (default desc)"),
+    },
+    async (params) => {
+      const query = new URLSearchParams();
+      if (params.page) query.set("page", String(params.page));
+      if (params.per_page) query.set("per_page", String(params.per_page));
+      if (params.filter) query.set("filter", params.filter);
+      if (params.order_by) query.set("order_by", params.order_by);
+      if (params.order_type) query.set("order_type", params.order_type);
 
-    const qs = query.toString();
-    const tickets = await freshdeskRequest(`/tickets${qs ? "?" + qs : ""}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(tickets, null, 2) }] };
-  }
-);
+      const qs = query.toString();
+      const tickets = await freshdeskRequest(
+        apiKey,
+        `/tickets${qs ? "?" + qs : ""}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(tickets, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get ticket details ---
-server.tool(
-  "get_ticket",
-  "Get a single ticket by ID, including conversation details.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-    include: z
-      .enum(["conversations", "requester", "company", "stats"])
-      .optional()
-      .describe("Include additional data"),
-  },
-  async (params) => {
-    const query = params.include ? `?include=${params.include}` : "";
-    const ticket = await freshdeskRequest(`/tickets/${params.ticket_id}${query}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(ticket, null, 2) }] };
-  }
-);
+  // --- Get ticket details ---
+  server.tool(
+    "get_ticket",
+    "Get a single ticket by ID, including conversation details.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+      include: z
+        .enum(["conversations", "requester", "company", "stats"])
+        .optional()
+        .describe("Include additional data"),
+    },
+    async (params) => {
+      const query = params.include ? `?include=${params.include}` : "";
+      const ticket = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}${query}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(ticket, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Search tickets ---
-server.tool(
-  "search_tickets",
-  'Search tickets using Freshdesk query language. Example query: "status:2 AND priority:3"',
-  {
-    query: z
-      .string()
-      .describe(
-        'Freshdesk search query. e.g. "status:2", "priority:1 AND created_at:>\'2024-01-01\'"'
-      ),
-    page: z.number().optional().describe("Page number (default 1)"),
-  },
-  async (params) => {
-    const query = new URLSearchParams();
-    query.set("query", `"${params.query}"`);
-    if (params.page) query.set("page", String(params.page));
+  // --- Search tickets ---
+  server.tool(
+    "search_tickets",
+    'Search tickets using Freshdesk query language. Example query: "status:2 AND priority:3"',
+    {
+      query: z
+        .string()
+        .describe(
+          'Freshdesk search query. e.g. "status:2", "priority:1 AND created_at:>\'2024-01-01\'"'
+        ),
+      page: z.number().optional().describe("Page number (default 1)"),
+    },
+    async (params) => {
+      const query = new URLSearchParams();
+      query.set("query", `"${params.query}"`);
+      if (params.page) query.set("page", String(params.page));
 
-    const results = await freshdeskRequest(`/search/tickets?${query.toString()}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(results, null, 2) }] };
-  }
-);
+      const results = await freshdeskRequest(
+        apiKey,
+        `/search/tickets?${query.toString()}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(results, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get ticket conversations (comments/replies) ---
-server.tool(
-  "get_ticket_conversations",
-  "Get all conversations (replies and notes) for a ticket.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-    page: z.number().optional().describe("Page number (default 1)"),
-  },
-  async (params) => {
-    const query = params.page ? `?page=${params.page}` : "";
-    const conversations = await freshdeskRequest(
-      `/tickets/${params.ticket_id}/conversations${query}`
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(conversations, null, 2) }] };
-  }
-);
+  // --- Get ticket conversations (comments/replies) ---
+  server.tool(
+    "get_ticket_conversations",
+    "Get all conversations (replies and notes) for a ticket.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+      page: z.number().optional().describe("Page number (default 1)"),
+    },
+    async (params) => {
+      const query = params.page ? `?page=${params.page}` : "";
+      const conversations = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}/conversations${query}`
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(conversations, null, 2),
+          },
+        ],
+      };
+    }
+  );
 
-// --- Add a note to a ticket ---
-server.tool(
-  "add_note_to_ticket",
-  "Add a private or public note to a ticket.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-    body: z.string().describe("The note content (HTML supported)"),
-    private: z
-      .boolean()
-      .optional()
-      .describe("Whether the note is private (default true)"),
-  },
-  async (params) => {
-    const note = await freshdeskRequest(
-      `/tickets/${params.ticket_id}/notes`,
-      "POST",
-      {
-        body: params.body,
-        private: params.private ?? true,
-      }
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(note, null, 2) }] };
-  }
-);
+  // --- Add a note to a ticket ---
+  server.tool(
+    "add_note_to_ticket",
+    "Add a private or public note to a ticket.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+      body: z.string().describe("The note content (HTML supported)"),
+      private: z
+        .boolean()
+        .optional()
+        .describe("Whether the note is private (default true)"),
+    },
+    async (params) => {
+      const note = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}/notes`,
+        "POST",
+        {
+          body: params.body,
+          private: params.private ?? true,
+        }
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(note, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Reply to a ticket ---
-server.tool(
-  "reply_to_ticket",
-  "Send a reply to a ticket.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-    body: z.string().describe("The reply content (HTML supported)"),
-  },
-  async (params) => {
-    const reply = await freshdeskRequest(
-      `/tickets/${params.ticket_id}/reply`,
-      "POST",
-      { body: params.body }
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(reply, null, 2) }] };
-  }
-);
+  // --- Reply to a ticket ---
+  server.tool(
+    "reply_to_ticket",
+    "Send a reply to a ticket.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+      body: z.string().describe("The reply content (HTML supported)"),
+    },
+    async (params) => {
+      const reply = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}/reply`,
+        "POST",
+        { body: params.body }
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(reply, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Create a ticket ---
-server.tool(
-  "create_ticket",
-  "Create a new Freshdesk ticket.",
-  {
-    subject: z.string().describe("Ticket subject"),
-    description: z.string().describe("Ticket description (HTML supported)"),
-    email: z.string().optional().describe("Requester email"),
-    priority: z
-      .number()
-      .optional()
-      .describe("Priority: 1=Low, 2=Medium, 3=High, 4=Urgent"),
-    status: z
-      .number()
-      .optional()
-      .describe("Status: 2=Open, 3=Pending, 4=Resolved, 5=Closed"),
-    type: z.string().optional().describe("Ticket type"),
-    tags: z.array(z.string()).optional().describe("Tags for the ticket"),
-  },
-  async (params) => {
-    const ticket = await freshdeskRequest("/tickets", "POST", {
-      subject: params.subject,
-      description: params.description,
-      email: params.email,
-      priority: params.priority ?? 1,
-      status: params.status ?? 2,
-      type: params.type,
-      tags: params.tags,
-    });
-    return { content: [{ type: "text" as const, text: JSON.stringify(ticket, null, 2) }] };
-  }
-);
+  // --- Create a ticket ---
+  server.tool(
+    "create_ticket",
+    "Create a new Freshdesk ticket.",
+    {
+      subject: z.string().describe("Ticket subject"),
+      description: z.string().describe("Ticket description (HTML supported)"),
+      email: z.string().optional().describe("Requester email"),
+      priority: z
+        .number()
+        .optional()
+        .describe("Priority: 1=Low, 2=Medium, 3=High, 4=Urgent"),
+      status: z
+        .number()
+        .optional()
+        .describe("Status: 2=Open, 3=Pending, 4=Resolved, 5=Closed"),
+      type: z.string().optional().describe("Ticket type"),
+      tags: z.array(z.string()).optional().describe("Tags for the ticket"),
+    },
+    async (params) => {
+      const ticket = await freshdeskRequest(apiKey, "/tickets", "POST", {
+        subject: params.subject,
+        description: params.description,
+        email: params.email,
+        priority: params.priority ?? 1,
+        status: params.status ?? 2,
+        type: params.type,
+        tags: params.tags,
+      });
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(ticket, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Update a ticket ---
-server.tool(
-  "update_ticket",
-  "Update an existing ticket's properties.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-    subject: z.string().optional().describe("New subject"),
-    description: z.string().optional().describe("New description"),
-    priority: z.number().optional().describe("Priority: 1=Low, 2=Medium, 3=High, 4=Urgent"),
-    status: z.number().optional().describe("Status: 2=Open, 3=Pending, 4=Resolved, 5=Closed"),
-    type: z.string().optional().describe("Ticket type"),
-    tags: z.array(z.string()).optional().describe("Tags"),
-  },
-  async (params) => {
-    const { ticket_id, ...body } = params;
-    const ticket = await freshdeskRequest(`/tickets/${ticket_id}`, "PUT", body);
-    return { content: [{ type: "text" as const, text: JSON.stringify(ticket, null, 2) }] };
-  }
-);
+  // --- Update a ticket ---
+  server.tool(
+    "update_ticket",
+    "Update an existing ticket's properties.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+      subject: z.string().optional().describe("New subject"),
+      description: z.string().optional().describe("New description"),
+      priority: z
+        .number()
+        .optional()
+        .describe("Priority: 1=Low, 2=Medium, 3=High, 4=Urgent"),
+      status: z
+        .number()
+        .optional()
+        .describe("Status: 2=Open, 3=Pending, 4=Resolved, 5=Closed"),
+      type: z.string().optional().describe("Ticket type"),
+      tags: z.array(z.string()).optional().describe("Tags"),
+    },
+    async (params) => {
+      const { ticket_id, ...body } = params;
+      const ticket = await freshdeskRequest(
+        apiKey,
+        `/tickets/${ticket_id}`,
+        "PUT",
+        body
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(ticket, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Delete a ticket ---
-server.tool(
-  "delete_ticket",
-  "Delete a ticket by ID.",
-  {
-    ticket_id: z.number().describe("The ticket ID to delete"),
-  },
-  async (params) => {
-    await freshdeskRequest(`/tickets/${params.ticket_id}`, "DELETE");
-    return { content: [{ type: "text" as const, text: `Ticket ${params.ticket_id} deleted.` }] };
-  }
-);
+  // --- Delete a ticket ---
+  server.tool(
+    "delete_ticket",
+    "Delete a ticket by ID.",
+    {
+      ticket_id: z.number().describe("The ticket ID to delete"),
+    },
+    async (params) => {
+      await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}`,
+        "DELETE"
+      );
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Ticket ${params.ticket_id} deleted.`,
+          },
+        ],
+      };
+    }
+  );
 
-// --- List contacts ---
-server.tool(
-  "list_contacts",
-  "List contacts from Freshdesk.",
-  {
-    page: z.number().optional().describe("Page number"),
-    email: z.string().optional().describe("Filter by email"),
-    phone: z.string().optional().describe("Filter by phone"),
-  },
-  async (params) => {
-    const query = new URLSearchParams();
-    if (params.page) query.set("page", String(params.page));
-    if (params.email) query.set("email", params.email);
-    if (params.phone) query.set("phone", params.phone);
+  // --- List contacts ---
+  server.tool(
+    "list_contacts",
+    "List contacts from Freshdesk.",
+    {
+      page: z.number().optional().describe("Page number"),
+      email: z.string().optional().describe("Filter by email"),
+      phone: z.string().optional().describe("Filter by phone"),
+    },
+    async (params) => {
+      const query = new URLSearchParams();
+      if (params.page) query.set("page", String(params.page));
+      if (params.email) query.set("email", params.email);
+      if (params.phone) query.set("phone", params.phone);
 
-    const qs = query.toString();
-    const contacts = await freshdeskRequest(`/contacts${qs ? "?" + qs : ""}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(contacts, null, 2) }] };
-  }
-);
+      const qs = query.toString();
+      const contacts = await freshdeskRequest(
+        apiKey,
+        `/contacts${qs ? "?" + qs : ""}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(contacts, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get contact ---
-server.tool(
-  "get_contact",
-  "Get a single contact by ID.",
-  {
-    contact_id: z.number().describe("The contact ID"),
-  },
-  async (params) => {
-    const contact = await freshdeskRequest(`/contacts/${params.contact_id}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(contact, null, 2) }] };
-  }
-);
+  // --- Get contact ---
+  server.tool(
+    "get_contact",
+    "Get a single contact by ID.",
+    {
+      contact_id: z.number().describe("The contact ID"),
+    },
+    async (params) => {
+      const contact = await freshdeskRequest(
+        apiKey,
+        `/contacts/${params.contact_id}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(contact, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- List agents ---
-server.tool(
-  "list_agents",
-  "List agents (support staff) from Freshdesk.",
-  {
-    page: z.number().optional().describe("Page number"),
-  },
-  async (params) => {
-    const query = params.page ? `?page=${params.page}` : "";
-    const agents = await freshdeskRequest(`/agents${query}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(agents, null, 2) }] };
-  }
-);
+  // --- List agents ---
+  server.tool(
+    "list_agents",
+    "List agents (support staff) from Freshdesk.",
+    {
+      page: z.number().optional().describe("Page number"),
+    },
+    async (params) => {
+      const query = params.page ? `?page=${params.page}` : "";
+      const agents = await freshdeskRequest(apiKey, `/agents${query}`);
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(agents, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get agent ---
-server.tool(
-  "get_agent",
-  "Get a single agent by ID.",
-  {
-    agent_id: z.number().describe("The agent ID"),
-  },
-  async (params) => {
-    const agent = await freshdeskRequest(`/agents/${params.agent_id}`);
-    return { content: [{ type: "text" as const, text: JSON.stringify(agent, null, 2) }] };
-  }
-);
+  // --- Get agent ---
+  server.tool(
+    "get_agent",
+    "Get a single agent by ID.",
+    {
+      agent_id: z.number().describe("The agent ID"),
+    },
+    async (params) => {
+      const agent = await freshdeskRequest(
+        apiKey,
+        `/agents/${params.agent_id}`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(agent, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- List groups ---
-server.tool(
-  "list_groups",
-  "List groups from Freshdesk.",
-  {},
-  async () => {
-    const groups = await freshdeskRequest("/groups");
-    return { content: [{ type: "text" as const, text: JSON.stringify(groups, null, 2) }] };
-  }
-);
+  // --- List groups ---
+  server.tool(
+    "list_groups",
+    "List groups from Freshdesk.",
+    {},
+    async () => {
+      const groups = await freshdeskRequest(apiKey, "/groups");
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(groups, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get ticket satisfaction ratings ---
-server.tool(
-  "get_ticket_satisfaction_ratings",
-  "Get satisfaction ratings for a ticket.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-  },
-  async (params) => {
-    const ratings = await freshdeskRequest(
-      `/tickets/${params.ticket_id}/satisfaction_ratings`
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(ratings, null, 2) }] };
-  }
-);
+  // --- Get ticket satisfaction ratings ---
+  server.tool(
+    "get_ticket_satisfaction_ratings",
+    "Get satisfaction ratings for a ticket.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+    },
+    async (params) => {
+      const ratings = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}/satisfaction_ratings`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(ratings, null, 2) },
+        ],
+      };
+    }
+  );
 
-// --- Get ticket time entries ---
-server.tool(
-  "get_ticket_time_entries",
-  "Get time entries logged against a ticket.",
-  {
-    ticket_id: z.number().describe("The ticket ID"),
-  },
-  async (params) => {
-    const entries = await freshdeskRequest(
-      `/tickets/${params.ticket_id}/time_entries`
-    );
-    return { content: [{ type: "text" as const, text: JSON.stringify(entries, null, 2) }] };
-  }
-);
+  // --- Get ticket time entries ---
+  server.tool(
+    "get_ticket_time_entries",
+    "Get time entries logged against a ticket.",
+    {
+      ticket_id: z.number().describe("The ticket ID"),
+    },
+    async (params) => {
+      const entries = await freshdeskRequest(
+        apiKey,
+        `/tickets/${params.ticket_id}/time_entries`
+      );
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(entries, null, 2) },
+        ],
+      };
+    }
+  );
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("Freshdesk MCP server running on stdio");
+  return server;
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
+// --- HTTP Transport ---
+
+const app = createMcpExpressApp({ host: "0.0.0.0" });
+
+const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+app.post("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+
+  try {
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionId && transports[sessionId]) {
+      transport = transports[sessionId];
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      const apiKey = getApiKeyFromRequest(req);
+      if (!apiKey) {
+        res.status(401).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Unauthorized: Missing Authorization: Bearer <api_key> header",
+          },
+          id: null,
+        });
+        return;
+      }
+
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          transports[sid] = transport;
+          sessionApiKeys[sid] = apiKey;
+        },
+      });
+
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid) {
+          delete transports[sid];
+          delete sessionApiKeys[sid];
+        }
+      };
+
+      const server = createServer(apiKey);
+      await server.connect(transport);
+      await transport.handleRequest(req, res, req.body);
+      return;
+    } else {
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID" },
+        id: null,
+      });
+      return;
+    }
+
+    await transport.handleRequest(req, res, req.body);
+  } catch (error) {
+    console.error("Error handling MCP request:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+});
+
+app.get("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  await transports[sessionId].handleRequest(req, res);
+});
+
+app.delete("/mcp", async (req, res) => {
+  const sessionId = req.headers["mcp-session-id"] as string | undefined;
+  if (!sessionId || !transports[sessionId]) {
+    res.status(400).send("Invalid or missing session ID");
+    return;
+  }
+  await transports[sessionId].handleRequest(req, res);
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Freshdesk MCP server listening on http://0.0.0.0:${PORT}/mcp`);
+});
+
+process.on("SIGINT", async () => {
+  console.log("Shutting down...");
+  for (const sid in transports) {
+    await transports[sid].close();
+    delete transports[sid];
+    delete sessionApiKeys[sid];
+  }
+  process.exit(0);
 });

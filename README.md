@@ -1,12 +1,13 @@
 # Freshdesk MCP Server
 
-A Model Context Protocol (MCP) server for interacting with the Freshdesk API. Provides tools to manage tickets, contacts, agents, and more.
+A Model Context Protocol (MCP) server for interacting with the Freshdesk API over HTTP (Streamable HTTP transport). Provides tools to manage tickets, contacts, agents, and more.
 
 ## Setup
 
 ```bash
 npm install
 npm run build
+npm start
 ```
 
 ## Environment Variables
@@ -14,23 +15,39 @@ npm run build
 | Variable | Description | Example |
 |---|---|---|
 | `FRESHDESK_DOMAIN` | Your Freshdesk domain (full hostname) | `yourcompany.freshdesk.com` or `support.yourdomain.com` |
-| `FRESHDESK_API_KEY` | Your Freshdesk API key | Found in Profile Settings > API Key |
+| `PORT` | HTTP port (default `3000`) | `3000` |
 
-## Claude Code Configuration
+## Authentication
 
-Add this to your Claude Code MCP settings (`claude_desktop_config.json` or `.claude/settings.json`):
+The Freshdesk API key is passed via the `Authorization: Bearer <api-key>` header on the MCP connection. It is captured on session initialization and used for all subsequent Freshdesk API calls in that session.
+
+## Docker
+
+```bash
+docker build -t freshdesk-mcp .
+docker run -d -p 3000:3000 -e FRESHDESK_DOMAIN=yourcompany.freshdesk.com freshdesk-mcp
+```
+
+The MCP endpoint is available at `http://your-host:3000/mcp`.
+
+## Claude Configuration
+
+### CLI
+
+```bash
+claude mcp add --header "Authorization: Bearer <freshdesk-api-key>" --transport http freshdesk https://your-domain.com/mcp
+```
+
+### Manual (settings JSON)
 
 ```json
 {
   "mcpServers": {
     "freshdesk": {
-      "command": "node",
-      "args": [
-        "C:/Repositories/fresh-desk-mcp/build/index.js"
-      ],
-      "env": {
-        "FRESHDESK_DOMAIN": "yourcompany.freshdesk.com",
-        "FRESHDESK_API_KEY": "your-api-key-here"
+      "type": "url",
+      "url": "https://your-domain.com/mcp",
+      "headers": {
+        "Authorization": "Bearer <freshdesk-api-key>"
       }
     }
   }
