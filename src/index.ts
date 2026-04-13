@@ -144,6 +144,7 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     this.codes.delete(authorizationCode);
 
     const token = randomUUID();
+    console.error(`[oauth] issued token=${token.slice(0, 8)}… for client=${client.client_id.slice(0, 8)}…`);
     const expiresIn = 86400; // 24 h
     this.tokens.set(token, {
       clientId: client.client_id,
@@ -164,7 +165,9 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    console.error(`[oauth] verifyAccessToken called, known tokens: ${this.tokens.size}`);
+    const prefix = token.slice(0, 8);
+    const stored = [...this.tokens.keys()].map((k) => k.slice(0, 8));
+    console.error(`[oauth] verifyAccessToken token=${prefix}… stored=[${stored}] (${this.tokens.size})`);
     const data = this.tokens.get(token);
     if (!data) {
       console.error("[oauth] token not found in store");
