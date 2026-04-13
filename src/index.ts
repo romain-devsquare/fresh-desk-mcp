@@ -83,8 +83,6 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     const pendingId = randomUUID();
     this.pendingAuths.set(pendingId, { client, params });
 
-    console.error(`[oauth] authorize: client=${client.client_id.slice(0, 8)}… redirect_uri=${params.redirectUri} state=${params.state ?? "none"}`);
-
     res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -155,7 +153,6 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     this.codes.delete(authorizationCode);
 
     const token = randomUUID();
-    console.error(`[oauth] issued access_token=${token} for client=${client.client_id.slice(0, 8)}…`);
     const expiresIn = 86400; // 24 h
     const tokenData: TokenData = {
       clientId: client.client_id,
@@ -184,21 +181,14 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
       // The client may present a token that differs from the one we
       // issued (e.g. Claude Code caches its own opaque token).
       // Accept it and bind it to the most recently completed auth flow.
-      console.error("[oauth] unknown token – binding to last issued auth");
       data = this.lastIssued;
       this.tokens.set(token, data);
       this.lastIssued = null;
     }
 
-    if (!data) {
-      console.error("[oauth] token not found and no pending auth");
+    if (!data || data.expiresAt < Date.now()) {
       throw new Error("Invalid or expired token");
     }
-    if (data.expiresAt < Date.now()) {
-      console.error("[oauth] token expired");
-      throw new Error("Invalid or expired token");
-    }
-    console.error("[oauth] token verified OK");
     return {
       token,
       clientId: data.clientId,
@@ -687,25 +677,6 @@ const app = createMcpExpressApp({ host: "0.0.0.0" });
 // from X-Forwarded-For instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set("trust proxy", 1);
 
-// Log every incoming request and intercept /token responses
-app.use((req, res, next) => {
-  const auth = req.headers.authorization
-    ? `Bearer ${req.headers.authorization.slice(7, 15)}…`
-    : "none";
-  console.error(`[http] ${req.method} ${req.path} auth=${auth}`);
-
-  // Intercept /token response to log what the client actually receives
-  if (req.path === "/token") {
-    const origJson = res.json.bind(res);
-    res.json = ((body: unknown) => {
-      console.error(`[http] /token response: ${JSON.stringify(body)}`);
-      return origJson(body);
-    }) as typeof res.json;
-  }
-
-  next();
-});
-
 // OAuth endpoints (/authorize, /token, /register, /.well-known/*)
 app.use(
   mcpAuthRouter({
@@ -735,25 +706,11 @@ app.post("/approve", express.urlencoded({ extended: false }), (req, res) => {
 });
 
 // Bearer-auth middleware for MCP routes
-const rawBearerAuth = requireBearerAuth({
+const bearerAuth = requireBearerAuth({
   verifier: oauthProvider,
   requiredScopes: [],
   resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
 });
-
-// Wrap to log auth failures that the SDK middleware silently swallows
-const bearerAuth: typeof rawBearerAuth = (req, res, next) => {
-  const hasAuth = !!req.headers.authorization;
-  console.error(`[mcp] ${req.method} ${req.path} auth-header=${hasAuth} session=${req.headers["mcp-session-id"] ?? "none"}`);
-  const originalJson = res.json.bind(res);
-  res.json = ((body: unknown) => {
-    if (res.statusCode >= 400) {
-      console.error(`[mcp] bearer auth rejected: ${res.statusCode}`, body);
-    }
-    return originalJson(body);
-  }) as typeof res.json;
-  rawBearerAuth(req, res, next);
-};
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
