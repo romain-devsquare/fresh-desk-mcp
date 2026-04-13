@@ -651,6 +651,11 @@ const oauthProvider = new FreshdeskOAuthProvider();
 
 const app = createMcpExpressApp({ host: "0.0.0.0" });
 
+// Trust the first reverse-proxy hop (traefik, nginx, etc.) so that
+// express-rate-limit inside mcpAuthRouter reads the real client IP
+// from X-Forwarded-For instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
+app.set("trust proxy", 1);
+
 // OAuth endpoints (/authorize, /token, /register, /.well-known/*)
 app.use(
   mcpAuthRouter({
