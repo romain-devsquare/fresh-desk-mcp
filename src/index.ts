@@ -74,6 +74,8 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     const pendingId = randomUUID();
     this.pendingAuths.set(pendingId, { client, params });
 
+    console.error(`[oauth] authorize: client=${client.client_id.slice(0, 8)}… redirect_uri=${params.redirectUri} state=${params.state ?? "none"}`);
+
     res.type("html").send(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -666,12 +668,22 @@ const app = createMcpExpressApp({ host: "0.0.0.0" });
 // from X-Forwarded-For instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set("trust proxy", 1);
 
-// Log every incoming request so we can trace the full auth flow
+// Log every incoming request and intercept /token responses
 app.use((req, res, next) => {
   const auth = req.headers.authorization
     ? `Bearer ${req.headers.authorization.slice(7, 15)}…`
     : "none";
   console.error(`[http] ${req.method} ${req.path} auth=${auth}`);
+
+  // Intercept /token response to log what the client actually receives
+  if (req.path === "/token") {
+    const origJson = res.json.bind(res);
+    res.json = ((body: unknown) => {
+      console.error(`[http] /token response: ${JSON.stringify(body)}`);
+      return origJson(body);
+    }) as typeof res.json;
+  }
+
   next();
 });
 
