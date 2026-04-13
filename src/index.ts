@@ -4,8 +4,24 @@ import { randomUUID } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
+import {
+  mcpAuthRouter,
+  getOAuthProtectedResourceMetadataUrl,
+} from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
-import type { Request } from "express";
+import type {
+  OAuthServerProvider,
+  AuthorizationParams,
+} from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
+import type {
+  OAuthClientInformationFull,
+  OAuthTokens,
+} from "@modelcontextprotocol/sdk/shared/auth.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
+import type { Request, Response as ExpressResponse } from "express";
+import express from "express";
 import { z } from "zod";
 
 const FRESHDESK_DOMAIN = process.env.FRESHDESK_DOMAIN;
@@ -17,14 +33,149 @@ if (!FRESHDESK_DOMAIN) {
 
 const BASE_URL = `https://${FRESHDESK_DOMAIN}/api/v2`;
 const PORT = parseInt(process.env.PORT || "3000", 10);
+const SERVER_URL = process.env.SERVER_URL || `http://localhost:${PORT}`;
 
-// Store the API key per session, extracted from the Authorization header on init
-const sessionApiKeys: Record<string, string> = {};
+// ---------------------------------------------------------------------------
+// OAuth provider – lets Claude authenticate and pass a Freshdesk API key
+// ---------------------------------------------------------------------------
 
-function getApiKeyFromRequest(req: Request): string | null {
-  const auth = req.headers["authorization"];
-  if (!auth || !auth.startsWith("Bearer ")) return null;
-  return auth.slice(7);
+interface PendingAuth {
+  client: OAuthClientInformationFull;
+  params: AuthorizationParams;
+  apiKey?: string;
+}
+
+class FreshdeskOAuthProvider implements OAuthServerProvider {
+  private clients = new Map<string, OAuthClientInformationFull>();
+  private pendingAuths = new Map<string, PendingAuth>();
+  private codes = new Map<string, PendingAuth>();
+  private tokens = new Map<
+    string,
+    { clientId: string; apiKey: string; scopes: string[]; expiresAt: number }
+  >();
+
+  get clientsStore(): OAuthRegisteredClientsStore {
+    return {
+      getClient: async (clientId: string) => this.clients.get(clientId),
+      registerClient: async (
+        clientMetadata: OAuthClientInformationFull
+      ): Promise<OAuthClientInformationFull> => {
+        this.clients.set(clientMetadata.client_id, clientMetadata);
+        return clientMetadata;
+      },
+    };
+  }
+
+  async authorize(
+    client: OAuthClientInformationFull,
+    params: AuthorizationParams,
+    res: ExpressResponse
+  ): Promise<void> {
+    const pendingId = randomUUID();
+    this.pendingAuths.set(pendingId, { client, params });
+
+    res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Authorize – Freshdesk MCP</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 420px; margin: 80px auto; padding: 0 16px; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin-top: 12px; font-weight: 600; }
+    input[type="password"] { width: 100%; padding: 8px; margin-top: 4px; box-sizing: border-box; }
+    button { margin-top: 16px; padding: 10px 24px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h1>Freshdesk MCP – Authorization</h1>
+  <p>Enter your Freshdesk API key to grant access.</p>
+  <form method="POST" action="/approve">
+    <input type="hidden" name="pending_id" value="${pendingId}">
+    <label for="api_key">Freshdesk API Key</label>
+    <input type="password" id="api_key" name="api_key" required autocomplete="off">
+    <button type="submit">Authorize</button>
+  </form>
+</body>
+</html>`);
+  }
+
+  /** Called by the POST /approve handler after the user submits their API key. */
+  completeAuthorization(
+    pendingId: string,
+    apiKey: string
+  ): string | null {
+    const pending = this.pendingAuths.get(pendingId);
+    if (!pending) return null;
+    this.pendingAuths.delete(pendingId);
+
+    const code = randomUUID();
+    this.codes.set(code, { ...pending, apiKey });
+
+    const redirectUrl = new URL(pending.params.redirectUri);
+    redirectUrl.searchParams.set("code", code);
+    if (pending.params.state) {
+      redirectUrl.searchParams.set("state", pending.params.state);
+    }
+    return redirectUrl.toString();
+  }
+
+  async challengeForAuthorizationCode(
+    _client: OAuthClientInformationFull,
+    authorizationCode: string
+  ): Promise<string> {
+    const data = this.codes.get(authorizationCode);
+    if (!data) throw new Error("Invalid authorization code");
+    return data.params.codeChallenge;
+  }
+
+  async exchangeAuthorizationCode(
+    client: OAuthClientInformationFull,
+    authorizationCode: string
+  ): Promise<OAuthTokens> {
+    const data = this.codes.get(authorizationCode);
+    if (!data) throw new Error("Invalid authorization code");
+    if (data.client.client_id !== client.client_id) {
+      throw new Error("Code was not issued to this client");
+    }
+    if (!data.apiKey) throw new Error("Authorization not completed");
+
+    this.codes.delete(authorizationCode);
+
+    const token = randomUUID();
+    const expiresIn = 86400; // 24 h
+    this.tokens.set(token, {
+      clientId: client.client_id,
+      apiKey: data.apiKey,
+      scopes: data.params.scopes ?? [],
+      expiresAt: Date.now() + expiresIn * 1000,
+    });
+
+    return {
+      access_token: token,
+      token_type: "bearer",
+      expires_in: expiresIn,
+    };
+  }
+
+  async exchangeRefreshToken(): Promise<OAuthTokens> {
+    throw new Error("Refresh tokens are not supported");
+  }
+
+  async verifyAccessToken(token: string): Promise<AuthInfo> {
+    const data = this.tokens.get(token);
+    if (!data || data.expiresAt < Date.now()) {
+      throw new Error("Invalid or expired token");
+    }
+    return {
+      token,
+      clientId: data.clientId,
+      scopes: data.scopes,
+      expiresAt: Math.floor(data.expiresAt / 1000),
+      extra: { freshdeskApiKey: data.apiKey },
+    };
+  }
 }
 
 async function freshdeskRequest(
@@ -489,13 +640,55 @@ function createServer(apiKey: string): McpServer {
   return server;
 }
 
-// --- HTTP Transport ---
+// ---------------------------------------------------------------------------
+// HTTP transport with OAuth
+// ---------------------------------------------------------------------------
+
+const serverUrl = new URL(SERVER_URL);
+const mcpUrl = new URL("/mcp", serverUrl);
+
+const oauthProvider = new FreshdeskOAuthProvider();
 
 const app = createMcpExpressApp({ host: "0.0.0.0" });
 
+// OAuth endpoints (/authorize, /token, /register, /.well-known/*)
+app.use(
+  mcpAuthRouter({
+    provider: oauthProvider,
+    issuerUrl: serverUrl,
+    resourceServerUrl: mcpUrl,
+    scopesSupported: [],
+  })
+);
+
+// Form submission endpoint for the authorization page
+app.post("/approve", express.urlencoded({ extended: false }), (req, res) => {
+  const { pending_id, api_key } = req.body as {
+    pending_id?: string;
+    api_key?: string;
+  };
+  if (!pending_id || !api_key) {
+    res.status(400).send("Missing required fields");
+    return;
+  }
+  const redirectUri = oauthProvider.completeAuthorization(pending_id, api_key);
+  if (!redirectUri) {
+    res.status(400).send("Invalid or expired authorization request");
+    return;
+  }
+  res.redirect(redirectUri);
+});
+
+// Bearer-auth middleware for MCP routes
+const bearerAuth = requireBearerAuth({
+  verifier: oauthProvider,
+  requiredScopes: [],
+  resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
+});
+
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-app.post("/mcp", async (req, res) => {
+app.post("/mcp", bearerAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
 
   try {
@@ -504,14 +697,11 @@ app.post("/mcp", async (req, res) => {
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
     } else if (!sessionId && isInitializeRequest(req.body)) {
-      const apiKey = getApiKeyFromRequest(req);
+      const apiKey = req.auth?.extra?.freshdeskApiKey as string | undefined;
       if (!apiKey) {
         res.status(401).json({
           jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Unauthorized: Missing Authorization: Bearer <api_key> header",
-          },
+          error: { code: -32000, message: "Unauthorized: no API key in token" },
           id: null,
         });
         return;
@@ -521,16 +711,12 @@ app.post("/mcp", async (req, res) => {
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
           transports[sid] = transport;
-          sessionApiKeys[sid] = apiKey;
         },
       });
 
       transport.onclose = () => {
         const sid = transport.sessionId;
-        if (sid) {
-          delete transports[sid];
-          delete sessionApiKeys[sid];
-        }
+        if (sid) delete transports[sid];
       };
 
       const server = createServer(apiKey);
@@ -559,7 +745,7 @@ app.post("/mcp", async (req, res) => {
   }
 });
 
-app.get("/mcp", async (req, res) => {
+app.get("/mcp", bearerAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports[sessionId]) {
     res.status(400).send("Invalid or missing session ID");
@@ -568,7 +754,7 @@ app.get("/mcp", async (req, res) => {
   await transports[sessionId].handleRequest(req, res);
 });
 
-app.delete("/mcp", async (req, res) => {
+app.delete("/mcp", bearerAuth, async (req, res) => {
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   if (!sessionId || !transports[sessionId]) {
     res.status(400).send("Invalid or missing session ID");
@@ -579,6 +765,7 @@ app.delete("/mcp", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Freshdesk MCP server listening on http://0.0.0.0:${PORT}/mcp`);
+  console.log(`OAuth issuer: ${serverUrl.href}`);
 });
 
 process.on("SIGINT", async () => {
@@ -586,7 +773,6 @@ process.on("SIGINT", async () => {
   for (const sid in transports) {
     await transports[sid].close();
     delete transports[sid];
-    delete sessionApiKeys[sid];
   }
   process.exit(0);
 });
