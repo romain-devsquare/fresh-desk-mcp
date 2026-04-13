@@ -144,7 +144,7 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     this.codes.delete(authorizationCode);
 
     const token = randomUUID();
-    console.error(`[oauth] issued token=${token.slice(0, 8)}… for client=${client.client_id.slice(0, 8)}…`);
+    console.error(`[oauth] issued access_token=${token} for client=${client.client_id.slice(0, 8)}…`);
     const expiresIn = 86400; // 24 h
     this.tokens.set(token, {
       clientId: client.client_id,
@@ -165,9 +165,9 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const prefix = token.slice(0, 8);
-    const stored = [...this.tokens.keys()].map((k) => k.slice(0, 8));
-    console.error(`[oauth] verifyAccessToken token=${prefix}… stored=[${stored}] (${this.tokens.size})`);
+    const stored = [...this.tokens.keys()];
+    console.error(`[oauth] verifyAccessToken token=${token}`);
+    console.error(`[oauth]   stored tokens: ${JSON.stringify(stored)}`);
     const data = this.tokens.get(token);
     if (!data) {
       console.error("[oauth] token not found in store");
@@ -665,6 +665,15 @@ const app = createMcpExpressApp({ host: "0.0.0.0" });
 // express-rate-limit inside mcpAuthRouter reads the real client IP
 // from X-Forwarded-For instead of throwing ERR_ERL_UNEXPECTED_X_FORWARDED_FOR.
 app.set("trust proxy", 1);
+
+// Log every incoming request so we can trace the full auth flow
+app.use((req, res, next) => {
+  const auth = req.headers.authorization
+    ? `Bearer ${req.headers.authorization.slice(7, 15)}…`
+    : "none";
+  console.error(`[http] ${req.method} ${req.path} auth=${auth}`);
+  next();
+});
 
 // OAuth endpoints (/authorize, /token, /register, /.well-known/*)
 app.use(
