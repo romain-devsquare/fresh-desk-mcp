@@ -58,10 +58,10 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   private codes = new Map<string, PendingAuth>();
   private tokens = new Map<string, TokenData>();
 
-  // Holds the most recently issued token data so we can match it to
-  // whatever token the client actually presents (Claude Code may cache
-  // its own opaque token that differs from the one we issued).
-  private lastIssued: TokenData | null = null;
+  // Queue of recently issued token data so we can match them to
+  // whatever opaque token the client actually presents.  Each entry
+  // is consumed once (first unknown token binds to the oldest entry).
+  private pendingTokens: { data: TokenData; issuedAt: number }[] = [];
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
@@ -161,7 +161,7 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
       expiresAt: Date.now() + expiresIn * 1000,
     };
     this.tokens.set(token, tokenData);
-    this.lastIssued = tokenData;
+    this.pendingTokens.push({ data: tokenData, issuedAt: Date.now() });
 
     return {
       access_token: token,
@@ -177,13 +177,18 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     let data = this.tokens.get(token);
 
-    if (!data && this.lastIssued) {
+    if (!data) {
       // The client may present a token that differs from the one we
       // issued (e.g. Claude Code caches its own opaque token).
-      // Accept it and bind it to the most recently completed auth flow.
-      data = this.lastIssued;
-      this.tokens.set(token, data);
-      this.lastIssued = null;
+      // Bind it to the oldest pending auth flow issued within the last 2 min.
+      const now = Date.now();
+      const TTL = 120_000; // 2 minutes
+      this.pendingTokens = this.pendingTokens.filter((p) => now - p.issuedAt < TTL);
+      const pending = this.pendingTokens.shift();
+      if (pending) {
+        data = pending.data;
+        this.tokens.set(token, data);
+      }
     }
 
     if (!data || data.expiresAt < Date.now()) {
