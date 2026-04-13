@@ -45,14 +45,23 @@ interface PendingAuth {
   apiKey?: string;
 }
 
+interface TokenData {
+  clientId: string;
+  apiKey: string;
+  scopes: string[];
+  expiresAt: number;
+}
+
 class FreshdeskOAuthProvider implements OAuthServerProvider {
   private clients = new Map<string, OAuthClientInformationFull>();
   private pendingAuths = new Map<string, PendingAuth>();
   private codes = new Map<string, PendingAuth>();
-  private tokens = new Map<
-    string,
-    { clientId: string; apiKey: string; scopes: string[]; expiresAt: number }
-  >();
+  private tokens = new Map<string, TokenData>();
+
+  // Holds the most recently issued token data so we can match it to
+  // whatever token the client actually presents (Claude Code may cache
+  // its own opaque token that differs from the one we issued).
+  private lastIssued: TokenData | null = null;
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
@@ -148,12 +157,14 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
     const token = randomUUID();
     console.error(`[oauth] issued access_token=${token} for client=${client.client_id.slice(0, 8)}…`);
     const expiresIn = 86400; // 24 h
-    this.tokens.set(token, {
+    const tokenData: TokenData = {
       clientId: client.client_id,
       apiKey: data.apiKey,
       scopes: data.params.scopes ?? [],
       expiresAt: Date.now() + expiresIn * 1000,
-    });
+    };
+    this.tokens.set(token, tokenData);
+    this.lastIssued = tokenData;
 
     return {
       access_token: token,
@@ -167,12 +178,20 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const stored = [...this.tokens.keys()];
-    console.error(`[oauth] verifyAccessToken token=${token}`);
-    console.error(`[oauth]   stored tokens: ${JSON.stringify(stored)}`);
-    const data = this.tokens.get(token);
+    let data = this.tokens.get(token);
+
+    if (!data && this.lastIssued) {
+      // The client may present a token that differs from the one we
+      // issued (e.g. Claude Code caches its own opaque token).
+      // Accept it and bind it to the most recently completed auth flow.
+      console.error("[oauth] unknown token – binding to last issued auth");
+      data = this.lastIssued;
+      this.tokens.set(token, data);
+      this.lastIssued = null;
+    }
+
     if (!data) {
-      console.error("[oauth] token not found in store");
+      console.error("[oauth] token not found and no pending auth");
       throw new Error("Invalid or expired token");
     }
     if (data.expiresAt < Date.now()) {
