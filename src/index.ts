@@ -164,10 +164,17 @@ class FreshdeskOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
+    console.error(`[oauth] verifyAccessToken called, known tokens: ${this.tokens.size}`);
     const data = this.tokens.get(token);
-    if (!data || data.expiresAt < Date.now()) {
+    if (!data) {
+      console.error("[oauth] token not found in store");
       throw new Error("Invalid or expired token");
     }
+    if (data.expiresAt < Date.now()) {
+      console.error("[oauth] token expired");
+      throw new Error("Invalid or expired token");
+    }
+    console.error("[oauth] token verified OK");
     return {
       token,
       clientId: data.clientId,
@@ -685,11 +692,25 @@ app.post("/approve", express.urlencoded({ extended: false }), (req, res) => {
 });
 
 // Bearer-auth middleware for MCP routes
-const bearerAuth = requireBearerAuth({
+const rawBearerAuth = requireBearerAuth({
   verifier: oauthProvider,
   requiredScopes: [],
   resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl),
 });
+
+// Wrap to log auth failures that the SDK middleware silently swallows
+const bearerAuth: typeof rawBearerAuth = (req, res, next) => {
+  const hasAuth = !!req.headers.authorization;
+  console.error(`[mcp] ${req.method} ${req.path} auth-header=${hasAuth} session=${req.headers["mcp-session-id"] ?? "none"}`);
+  const originalJson = res.json.bind(res);
+  res.json = ((body: unknown) => {
+    if (res.statusCode >= 400) {
+      console.error(`[mcp] bearer auth rejected: ${res.statusCode}`, body);
+    }
+    return originalJson(body);
+  }) as typeof res.json;
+  rawBearerAuth(req, res, next);
+};
 
 const transports: Record<string, StreamableHTTPServerTransport> = {};
 
